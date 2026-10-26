@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Homero Ollie</title>
+<style>
+  :root { --bg: #1d2533; --fg: #f4f1e8; --accent: #ffd90f; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; padding: 16px;
+    background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  canvas { width: 100%; max-width: 960px; aspect-ratio: 16 / 9; border-radius: 12px;
+           box-shadow: 0 10px 40px rgba(0,0,0,.45); display: block; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  button {
+    font: inherit; font-weight: 600; padding: 8px 16px; border-radius: 999px; cursor: pointer;
+    border: 2px solid var(--accent); background: transparent; color: var(--accent);
+  }
+  button[aria-pressed="true"] { background: var(--accent); color: #222; }
+</style>
+</head>
+<body>
+<canvas id="scene" width="960" height="540"></canvas>
+<div class="controls">
+  <button id="pause" aria-pressed="false">Pausa</button>
+  <button id="slow" aria-pressed="false">Cámara lenta</button>
+  <button id="restart">Reiniciar</button>
+</div>
+<script>
+const canvas = document.getElementById('scene');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+const homer = new Image();
+homer.src = 'homer.png';
+
+// ---------- Escenario ----------
+const TOP_Y = 330;          // nivel de la plataforma superior
+const BOTTOM_Y = 462;       // nivel del piso inferior
+const STAIRS_X = 430;       // inicio de las escaleras
+const STEPS = 5;
+const STEP_W = 42;
+const STEP_H = (BOTTOM_Y - TOP_Y) / STEPS;
+const STAIRS_END = STAIRS_X + STEPS * STEP_W;
+
+function groundY(x) {
+  if (x < STAIRS_X) return TOP_Y;
+  if (x >= STAIRS_END) return BOTTOM_Y;
+  return TOP_Y + (Math.floor((x - STAIRS_X) / STEP_W) + 1) * STEP_H;
+}
+
+// ---------- Línea de tiempo ----------
+const SPEED = 340;            // px/s
+const START_X = -140;
+const TAKEOFF_X = 372;
+const LAND_X = 735;
+const END_X = W + 160;
+const T_TAKEOFF = (TAKEOFF_X - START_X) / SPEED;
+const T_FLIGHT = (LAND_X - TAKEOFF_X) / SPEED;
+const T_LAND = T_TAKEOFF + T_FLIGHT;
+const T_END = T_LAND + (END_X - LAND_X) / SPEED;
+const LOOP = T_END + 0.5;
+const APEX = 165;             // altura del salto sobre la línea de vuelo
+
+const ease = t => t * t * (3 - 2 * t);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+
+// Estado del skater en el tiempo t (determinista, para poder grabarlo).
+function stateAt(t) {
+  const x = START_X + SPEED * t;
+  let y = groundY(x), boardAngle = 0, boardLift = 0, squash = 1, lean = 0, airborne = false;
+
+  const pre = T_TAKEOFF - t;
+  if (pre > 0 && pre < 0.28) {                 // agacharse antes del pop
+    squash = 1 - 0.14 * ease(1 - pre / 0.28);
+    lean = -4 * ease(1 - pre / 0.28);
+  }
+  if (t >= T_TAKEOFF && t < T_LAND) {          // en el aire
+    airborne = true;
+    const s = (t - T_TAKEOFF) / T_FLIGHT;
+    y = lerp(TOP_Y, BOTTOM_Y, s) - APEX * 4 * s * (1 - s);
+    // pop: la cola golpea, la punta sube y luego se nivela con el pie delantero
+    if (s < 0.07) boardAngle = -32 * (s / 0.07);
+    else if (s < 0.38) boardAngle = -32 * (1 - ease((s - 0.07) / 0.31));
+    else if (s > 0.72) boardAngle = 7 * Math.sin(Math.PI * (s - 0.72) / 0.28);
+    boardLift = 26 * Math.sin(Math.PI * clamp(s / 0.85, 0, 1)); // la tabla sube a los pies
+    squash = s < 0.12 ? lerp(0.86, 1.06, s / 0.12) : lerp(1.06, 0.9, Math.sin(Math.PI * s));
+    lean = boardAngle * 0.35;
+  }
+  const post = t - T_LAND;
+  if (post >= 0 && post < 0.35) {              // aterrizaje: aplastarse y recuperarse
+    const k = post / 0.35;
+    squash = 1 - 0.18 * Math.sin(Math.PI * k) * (1 - k * 0.3);
+    lean = 5 * Math.sin(Math.PI * k);
+  }
+  return { x, y, boardAngle, boardLift, squash, lean, airborne };
+}
+
+// ---------- Partículas (deterministas a partir del tiempo) ----------
+function rand(seed) { const s = Math.sin(seed * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+
+function drawBurst(t, t0, cx, cy, count, spread, color, seedBase) {
+  const age = t - t0;
+  if (age < 0 || age > 0.7) return;
+  for (let i = 0; i < count; i++) {
+    const a = Math.PI + rand(seedBase + i) * Math.PI;      // hacia arriba
+    const v = 60 + rand(seedBase + i + 50) * spread;
+    const px = cx + Math.cos(a) * v * age;
+    const py = cy + Math.sin(a) * v * age * 0.6 + 140 * age * age;
+    const r = (2 + rand(seedBase + i + 99) * 5) * (1 - age / 0.7);
+    ctx.globalAlpha = 1 - age / 0.7;
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- Dibujo del escenario ----------
+function drawBackground(t) {
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#5aa9e6'); sky.addColorStop(0.7, '#a9d8f5'); sky.addColorStop(1, '#d9f0fb');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  // sol
+  ctx.fillStyle = '#ffe680';
+  ctx.beginPath(); ctx.arc(830, 90, 46, 0, Math.PI * 2); ctx.fill();
+
+  // nubes a la deriva
+  for (let i = 0; i < 4; i++) {
+    const cx = ((i * 290 + t * (14 + i * 6)) % (W + 300)) - 150;
+    const cy = 70 + i * 34 % 90;
+    ctx.fillStyle = 'rgba(255,255,255,.92)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 26, 0, Math.PI * 2); ctx.arc(cx + 30, cy - 12, 32, 0, Math.PI * 2);
+    ctx.arc(cx + 64, cy, 24, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // torres de enfriamiento de la planta nuclear al fondo
+  ctx.fillStyle = '#8fb3c9';
+  for (const [bx, bw, bh] of [[600, 90, 150], [705, 110, 185]]) {
+    const base = 330;
+    ctx.beginPath();
+    ctx.moveTo(bx, base);
+    ctx.quadraticCurveTo(bx + bw * 0.28, base - bh * 0.55, bx + bw * 0.12, base - bh);
+    ctx.lineTo(bx + bw * 0.88, base - bh);
+    ctx.quadraticCurveTo(bx + bw * 0.72, base - bh * 0.55, bx + bw, base);
+    ctx.closePath(); ctx.fill();
+  }
+  // edificios lejanos
+  ctx.fillStyle = '#a3c3d6';
+  for (let i = 0; i < 9; i++) {
+    const bx = 20 + i * 64, bh = 50 + rand(i + 3) * 90;
+    ctx.fillRect(bx, 330 - bh, 50, bh);
+  }
+  // pasto
+  ctx.fillStyle = '#7cc46a'; ctx.fillRect(0, 300, W, 40);
+}
+
+function drawGround() {
+  const concrete = '#c9c4ba', edge = '#9d978c', dark = '#857f74';
+  // plataforma superior
+  ctx.fillStyle = concrete; ctx.fillRect(0, TOP_Y, STAIRS_X, H - TOP_Y);
+  // escalones
+  for (let i = 0; i < STEPS; i++) {
+    const sx = STAIRS_X + i * STEP_W, sy = TOP_Y + (i + 1) * STEP_H;
+    ctx.fillStyle = concrete; ctx.fillRect(sx, sy, W - sx, H - sy);
+    ctx.fillStyle = dark; ctx.fillRect(sx, sy - STEP_H, 4, STEP_H);   // contrahuella en sombra
+    ctx.fillStyle = edge; ctx.fillRect(sx, sy, STEP_W, 4);            // borde del escalón
+  }
+  ctx.fillStyle = dark; ctx.fillRect(STAIRS_X - 2, TOP_Y, 4, STEP_H);
+  ctx.fillStyle = edge; ctx.fillRect(0, TOP_Y, STAIRS_X, 4);
+  ctx.fillRect(STAIRS_END, BOTTOM_Y, W - STAIRS_END, 4);
+  // juntas de la banqueta
+  ctx.strokeStyle = 'rgba(0,0,0,.08)'; ctx.lineWidth = 2;
+  for (let x = 60; x < STAIRS_X; x += 120) { ctx.beginPath(); ctx.moveTo(x, TOP_Y + 4); ctx.lineTo(x - 30, H); ctx.stroke(); }
+  for (let x = STAIRS_END + 80; x < W; x += 120) { ctx.beginPath(); ctx.moveTo(x, BOTTOM_Y + 4); ctx.lineTo(x - 20, H); ctx.stroke(); }
+
+  // pasamanos
+  ctx.strokeStyle = '#4b5563'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  const railH = 58;
+  ctx.beginPath();
+  ctx.moveTo(STAIRS_X - 30, TOP_Y - railH);
+  ctx.lineTo(STAIRS_X + 10, TOP_Y - railH);
+  ctx.lineTo(STAIRS_END - 10, BOTTOM_Y - railH);
+  ctx.lineTo(STAIRS_END + 30, BOTTOM_Y - railH);
+  ctx.stroke();
+  ctx.lineWidth = 4;
+  for (const px of [STAIRS_X + 10, STAIRS_X + 2.5 * STEP_W, STAIRS_END - 10]) {
+    const top = lerp(TOP_Y - railH, BOTTOM_Y - railH, (px - STAIRS_X - 10) / (STEPS * STEP_W - 20));
+    ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, groundY(px - 1)); ctx.stroke();
+  }
+}
+
+// ---------- Skate ----------
+const BOARD_L = 128;
+function drawBoard(wheelSpin) {
+  // ruedas y trucks
+  for (const wx of [-40, 40]) {
+    ctx.fillStyle = '#6b7280'; ctx.fillRect(wx - 9, 4, 18, 6);
+    ctx.fillStyle = '#f5f5f4';
+    ctx.beginPath(); ctx.arc(wx, 15, 8, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#444'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(wx, 15); ctx.lineTo(wx + Math.cos(wheelSpin) * 6, 15 + Math.sin(wheelSpin) * 6); ctx.stroke();
+  }
+  // tabla con nose y tail levantados
+  const half = BOARD_L / 2;
+  ctx.fillStyle = '#e4572e'; ctx.strokeStyle = '#2b1b17'; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(-half + 14, 0);
+  ctx.lineTo(half - 14, 0);
+  ctx.quadraticCurveTo(half + 2, 0, half + 4, -10);
+  ctx.quadraticCurveTo(half + 4, -4, half - 12, 5);
+  ctx.lineTo(-half + 12, 5);
+  ctx.quadraticCurveTo(-half - 4, -4, -half - 4, -10);
+  ctx.quadraticCurveTo(-half - 2, 0, -half + 14, 0);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#ffd90f'; ctx.fillRect(-14, 0.5, 28, 3.5);
+}
+
+// ---------- Personaje ----------
+const HOMER_H = 190;
+function drawSkater(t, alpha = 1) {
+  const s = stateAt(t);
+  const boardY = s.y - 19 - s.boardLift;         // 19 = radio rueda + truck
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  // tabla (gira sobre la cola en el pop)
+  ctx.save();
+  const pivotX = s.boardAngle < 0 && s.airborne ? -BOARD_L / 2 + 8 : 0;
+  ctx.translate(s.x + pivotX, boardY);
+  ctx.rotate(s.boardAngle * Math.PI / 180);
+  ctx.translate(-pivotX, 0);
+  drawBoard((s.x / 8) % (Math.PI * 2));
+  ctx.restore();
+
+  // Homero sobre la tabla
+  if (homer.complete && homer.naturalWidth) {
+    const hw = HOMER_H * homer.naturalWidth / homer.naturalHeight;
+    const hh = HOMER_H * s.squash;
+    ctx.save();
+    ctx.translate(s.x, boardY + 2);
+    ctx.rotate(s.lean * Math.PI / 180);
+    ctx.scale(1 + (1 - s.squash) * 0.5, 1);       // conservar volumen al aplastarse
+    ctx.drawImage(homer, -hw / 2, -hh, hw, hh);
+    ctx.restore();
+  }
+  ctx.restore();
+  return s;
+}
+
+function drawShadow(s) {
+  const gy = groundY(s.x);
+  const h = gy - s.y;
+  const k = clamp(1 - h / 260, 0.25, 1);
+  ctx.fillStyle = `rgba(0,0,0,${0.22 * k})`;
+  ctx.beginPath(); ctx.ellipse(s.x, gy + 2, 70 * k, 7 * k, 0, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawSpeech(t, s) {
+  const age = t - T_LAND - 0.1;
+  if (age < 0 || age > 0.75) return;
+  const pop = Math.min(1, age / 0.15);
+  const bx = Math.min(s.x + 70, W - 100), by = s.y - HOMER_H - 20;
+  ctx.save();
+  ctx.translate(bx, by); ctx.scale(pop, pop);
+  ctx.globalAlpha = age > 0.55 ? 1 - (age - 0.55) / 0.2 : 1;
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#222'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.ellipse(0, 0, 92, 36, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-50, 24); ctx.lineTo(-74, 52); ctx.lineTo(-28, 30); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.fillRect(-52, 20, 26, 10);
+  ctx.fillStyle = '#222'; ctx.font = 'bold 30px "Comic Sans MS", "Chalkboard SE", system-ui, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('¡Woo-hoo!', 0, 2);
+  ctx.restore();
+}
+
+function drawSpeedLines(t, s) {
+  if (s.x < 0 || s.x > W) return;
+  ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  for (let i = 0; i < 4; i++) {
+    const off = (t * 900 + i * 37) % 60;
+    const ly = s.y - 40 - i * 38;
+    ctx.beginPath(); ctx.moveTo(s.x - 70 - off, ly); ctx.lineTo(s.x - 110 - off - i * 6, ly); ctx.stroke();
+  }
+}
+
+// ---------- Render de un cuadro ----------
+function renderAt(t) {
+  t = ((t % LOOP) + LOOP) % LOOP;
+  drawBackground(t);
+  drawGround();
+
+  const s = stateAt(t);
+  drawShadow(s);
+  drawSpeedLines(t, s);
+
+  // estela fantasma durante el salto
+  if (s.airborne) for (let k = 4; k >= 1; k--) {
+    const tg = t - k * 0.05;
+    if (tg > T_TAKEOFF) drawSkater(tg, 0.1 + 0.05 * (4 - k));
+  }
+  drawSkater(t);
+
+  drawBurst(t, T_TAKEOFF, TAKEOFF_X - BOARD_L / 2 + 6, TOP_Y, 10, 120, '#b8b2a6', 1);
+  drawBurst(t, T_LAND, LAND_X - 40, BOTTOM_Y, 9, 150, '#b8b2a6', 21);
+  drawBurst(t, T_LAND, LAND_X + 40, BOTTOM_Y, 9, 150, '#b8b2a6', 41);
+  drawSpeech(t, s);
+}
+
+// ---------- Bucle ----------
+let simTime = 0, last = null, paused = false, slow = false;
+function frame(now) {
+  if (last !== null && !paused) simTime += (now - last) / 1000 * (slow ? 0.3 : 1);
+  last = now;
+  renderAt(simTime);
+  requestAnimationFrame(frame);
+}
+
+const toggle = (btn, get, set) => btn.addEventListener('click', () => {
+  set(!get()); btn.setAttribute('aria-pressed', String(get()));
+});
+toggle(document.getElementById('pause'), () => paused, v => paused = v);
+toggle(document.getElementById('slow'), () => slow, v => slow = v);
+document.getElementById('restart').addEventListener('click', () => { simTime = 0; });
+
+window.renderAt = renderAt;   // usado por record.js para exportar el video
+window.LOOP = LOOP;
+homer.onload = () => { window.ready = true; if (!new URLSearchParams(location.search).has('capture')) requestAnimationFrame(frame); };
+</script>
+</body>
+</html>
