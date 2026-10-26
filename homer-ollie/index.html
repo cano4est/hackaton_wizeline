@@ -5,47 +5,57 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Homero Ollie</title>
 <style>
-  :root { --bg: #1d2533; --fg: #f4f1e8; --accent: #ffd90f; }
+  @font-face { font-family: "Bangers"; src: url("fonts/Bangers.ttf") format("truetype"); }
+  :root { --bg: #11151c; --fg: #f4f1e8; --accent: #ffd90f; }
   * { box-sizing: border-box; }
   body {
     margin: 0; min-height: 100vh; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; gap: 14px; padding: 16px;
+    align-items: center; justify-content: center; gap: 16px; padding: 16px;
     background: var(--bg); color: var(--fg);
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
   }
-  canvas { width: 100%; max-width: 960px; aspect-ratio: 16 / 9; border-radius: 12px;
-           box-shadow: 0 10px 40px rgba(0,0,0,.45); display: block; }
+  canvas { width: 100%; max-width: 1100px; aspect-ratio: 16 / 9; border-radius: 10px;
+           box-shadow: 0 18px 60px rgba(0,0,0,.6); display: block; background: #000; }
   .controls { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
   button {
-    font: inherit; font-weight: 600; padding: 8px 16px; border-radius: 999px; cursor: pointer;
+    font: inherit; font-weight: 600; padding: 8px 18px; border-radius: 999px; cursor: pointer;
     border: 2px solid var(--accent); background: transparent; color: var(--accent);
   }
-  button[aria-pressed="true"] { background: var(--accent); color: #222; }
+  button[aria-pressed="true"] { background: var(--accent); color: #1a1a1a; }
 </style>
 </head>
 <body>
-<canvas id="scene" width="960" height="540"></canvas>
+<canvas id="scene" width="1920" height="1080"></canvas>
 <div class="controls">
   <button id="pause" aria-pressed="false">Pausa</button>
   <button id="slow" aria-pressed="false">Cámara lenta</button>
+  <button id="sound" aria-pressed="false">Sonido</button>
   <button id="restart">Reiniciar</button>
 </div>
 <script>
 const canvas = document.getElementById('scene');
 const ctx = canvas.getContext('2d');
-const W = canvas.width, H = canvas.height;
+const VW = 960, VH = 540, RES = canvas.width / VW;   // se dibuja en 960x540 lógicos
+const INK = '#1f1a17';                               // contorno estilo caricatura
 
 const homer = new Image();
 homer.src = 'homer.png';
 
-// ---------- Escenario ----------
-const TOP_Y = 330;          // nivel de la plataforma superior
-const BOTTOM_Y = 462;       // nivel del piso inferior
-const STAIRS_X = 430;       // inicio de las escaleras
-const STEPS = 5;
-const STEP_W = 42;
-const STEP_H = (BOTTOM_Y - TOP_Y) / STEPS;
-const STAIRS_END = STAIRS_X + STEPS * STEP_W;
+const ease = t => t * t * (3 - 2 * t);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const range = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+const rad = d => d * Math.PI / 180;
+function rand(seed) { const s = Math.sin(seed * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+
+// ================= Mundo =================
+const TOP_Y = 360, STEPS = 6, STEP_W = 44, STEP_H = 24;
+const BOTTOM_Y = TOP_Y + STEPS * STEP_H;
+const STAIRS_X = 0, STAIRS_END = STAIRS_X + STEPS * STEP_W;
+const RAIL_H = 58;
+const JOINTS = [];                                   // juntas de la banqueta (también suenan)
+for (let x = -700; x < STAIRS_X - 40; x += 140) JOINTS.push(x);
+for (let x = STAIRS_END + 90; x < 1400; x += 140) JOINTS.push(x);
 
 function groundY(x) {
   if (x < STAIRS_X) return TOP_Y;
@@ -53,286 +63,547 @@ function groundY(x) {
   return TOP_Y + (Math.floor((x - STAIRS_X) / STEP_W) + 1) * STEP_H;
 }
 
-// ---------- Línea de tiempo ----------
-const SPEED = 340;            // px/s
-const START_X = -140;
-const TAKEOFF_X = 372;
-const LAND_X = 735;
-const END_X = W + 160;
-const T_TAKEOFF = (TAKEOFF_X - START_X) / SPEED;
-const T_FLIGHT = (LAND_X - TAKEOFF_X) / SPEED;
-const T_LAND = T_TAKEOFF + T_FLIGHT;
-const T_END = T_LAND + (END_X - LAND_X) / SPEED;
-const LOOP = T_END + 0.5;
-const APEX = 165;             // altura del salto sobre la línea de vuelo
-
-const ease = t => t * t * (3 - 2 * t);
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const lerp = (a, b, t) => a + (b - a) * t;
-
-// Estado del skater en el tiempo t (determinista, para poder grabarlo).
-function stateAt(t) {
-  const x = START_X + SPEED * t;
-  let y = groundY(x), boardAngle = 0, boardLift = 0, squash = 1, lean = 0, airborne = false;
-
-  const pre = T_TAKEOFF - t;
-  if (pre > 0 && pre < 0.28) {                 // agacharse antes del pop
-    squash = 1 - 0.14 * ease(1 - pre / 0.28);
-    lean = -4 * ease(1 - pre / 0.28);
-  }
-  if (t >= T_TAKEOFF && t < T_LAND) {          // en el aire
-    airborne = true;
-    const s = (t - T_TAKEOFF) / T_FLIGHT;
-    y = lerp(TOP_Y, BOTTOM_Y, s) - APEX * 4 * s * (1 - s);
-    // pop: la cola golpea, la punta sube y luego se nivela con el pie delantero
-    if (s < 0.07) boardAngle = -32 * (s / 0.07);
-    else if (s < 0.38) boardAngle = -32 * (1 - ease((s - 0.07) / 0.31));
-    else if (s > 0.72) boardAngle = 7 * Math.sin(Math.PI * (s - 0.72) / 0.28);
-    boardLift = 26 * Math.sin(Math.PI * clamp(s / 0.85, 0, 1)); // la tabla sube a los pies
-    squash = s < 0.12 ? lerp(0.86, 1.06, s / 0.12) : lerp(1.06, 0.9, Math.sin(Math.PI * s));
-    lean = boardAngle * 0.35;
-  }
-  const post = t - T_LAND;
-  if (post >= 0 && post < 0.35) {              // aterrizaje: aplastarse y recuperarse
-    const k = post / 0.35;
-    squash = 1 - 0.18 * Math.sin(Math.PI * k) * (1 - k * 0.3);
-    lean = 5 * Math.sin(Math.PI * k);
-  }
-  return { x, y, boardAngle, boardLift, squash, lean, airborne };
+// ================= Rig de Homero =================
+// Filas de homer.png: cadera y tobillo separan torso, piernas y zapatos.
+const SRC_HIP = 598, SRC_ANKLE = 898, SRC_FOOT_X = 184;
+const HOMER_H = 210;
+let K = 0, SRC_W = 0, SRC_H = 0, LEG = 0, SHOE = 0;
+function setupRig() {
+  SRC_W = homer.naturalWidth; SRC_H = homer.naturalHeight;
+  K = HOMER_H / SRC_H;
+  LEG = (SRC_ANKLE - SRC_HIP) * K;
+  SHOE = (SRC_H - SRC_ANKLE) * K;
 }
 
-// ---------- Partículas (deterministas a partir del tiempo) ----------
-function rand(seed) { const s = Math.sin(seed * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+// Vista frontal: doblar las rodillas = piernas más cortas y un poco más abiertas.
+const legScale = theta => 1 - 0.42 * clamp(theta / 64, 0, 1);
+const legHeight = theta => LEG * legScale(theta) + SHOE;
 
-function drawBurst(t, t0, cx, cy, count, spread, color, seedBase) {
-  const age = t - t0;
-  if (age < 0 || age > 0.7) return;
-  for (let i = 0; i < count; i++) {
-    const a = Math.PI + rand(seedBase + i) * Math.PI;      // hacia arriba
-    const v = 60 + rand(seedBase + i + 50) * spread;
-    const px = cx + Math.cos(a) * v * age;
-    const py = cy + Math.sin(a) * v * age * 0.6 + 140 * age * age;
-    const r = (2 + rand(seedBase + i + 99) * 5) * (1 - age / 0.7);
-    ctx.globalAlpha = 1 - age / 0.7;
-    ctx.fillStyle = color;
-    ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); ctx.fill();
+// Pies en el origen; dibuja zapatos, piernas y torso como piezas del rig.
+function drawHomer(theta, lean, stretch) {
+  const f = legScale(theta), spread = 1 + (1 - f) * 0.35;
+  const left = -SRC_FOOT_X * K, w = SRC_W * K, legH = LEG * f;
+  ctx.drawImage(homer, 0, SRC_ANKLE, SRC_W, SRC_H - SRC_ANKLE, left, -SHOE, w, SHOE);
+  ctx.drawImage(homer, 0, SRC_HIP, SRC_W, SRC_ANKLE - SRC_HIP + 2,
+                left * spread, -SHOE - legH - 0.5, w * spread, legH + 1.5);
+  const hy = -SHOE - legH;
+  ctx.save();
+  ctx.translate(0, hy + 2);
+  ctx.rotate(rad(lean));
+  ctx.scale(2 - stretch, stretch);
+  ctx.drawImage(homer, 0, 0, SRC_W, SRC_HIP + 4, left, -SRC_HIP * K, w, (SRC_HIP + 4) * K);
+  ctx.restore();
+  return { hx: 0, hy };
+}
+
+// ================= Coreografía (tiempo de animación tau) =================
+const SPEED = 380;
+const START_X = -770, TAKEOFF_X = -58, LAND_X = 420, END_X = 1190;
+const T0 = (TAKEOFF_X - START_X) / SPEED;          // despegue
+const TF = (LAND_X - TAKEOFF_X) / SPEED;           // tiempo de vuelo
+const T1 = T0 + TF;                                // aterrizaje
+const T_END = T1 + (END_X - LAND_X) / SPEED;
+const POP = 0.07;                                  // golpe de cola antes del despegue
+const HIP_ARC = 150;                               // altura de la parábola de la cadera
+const DECK = 22;                                   // de la lija al piso
+
+function popAngle(tau) { return -28 * ease(range(tau, T0 - POP, T0)); }
+// Altura extra del centro de la tabla al girar sobre las ruedas traseras.
+function popLift(a) { const r = rad(-a); return 38 * Math.sin(r) + DECK * Math.cos(r) - DECK; }
+
+function kneeAngle(tau) {
+  if (tau < T0 - 0.42) return 12 + 2 * Math.sin(tau * 9);
+  if (tau < T0 - POP) return lerp(12, 56, ease(range(tau, T0 - 0.42, T0 - POP)));   // anticipación
+  if (tau < T0) return lerp(56, 6, ease(range(tau, T0 - POP, T0)));               // pop: extensión
+  if (tau < T1) {
+    const s = (tau - T0) / TF;
+    if (s < 0.45) return lerp(6, 64, ease(range(s, 0, 0.45)));                      // recoger piernas
+    return lerp(64, 22, ease(range(s, 0.5, 0.95)));                                 // estirar para caer
+  }
+  const a = tau - T1;
+  if (a < 0.12) return lerp(22, 60, ease(a / 0.12));                                // amortiguar
+  if (a < 0.6) return 12 + 48 * Math.exp(-(a - 0.12) * 7) * Math.cos((a - 0.12) * 9);
+  return 12 + 2 * Math.sin(tau * 9);
+}
+
+function leanAngle(tau) {
+  if (tau < T0 - 0.42) return 4;
+  if (tau < T0 - POP) return lerp(4, 14, ease(range(tau, T0 - 0.42, T0 - POP)));
+  if (tau < T1) return lerp(14, 6, ease(range(tau, T0 - POP, T0 + 0.25)));
+  const a = tau - T1;
+  return 4 + 12 * Math.exp(-a * 5) * Math.sin(Math.min(a, 0.6) / 0.6 * Math.PI + 0.3);
+}
+
+function stateAt(tau) {
+  const x = START_X + SPEED * tau;
+  const theta = kneeAngle(tau);
+  const legH = legHeight;
+  let feetY, board = 0, airborne = false, stretch = 1;
+
+  if (tau < T0) {
+    board = popAngle(tau);
+    feetY = groundY(x) - DECK - popLift(board);
+    stretch = 1 + 0.06 * Math.sin(Math.PI * range(tau, T0 - POP, T0 + POP));
+  } else if (tau < T1) {
+    airborne = true;
+    const s = (tau - T0) / TF;
+    const a0 = popAngle(T0);
+    const hip0 = TOP_Y - DECK - popLift(a0) - legH(kneeAngle(T0));
+    const hip1 = BOTTOM_Y - DECK - legH(kneeAngle(T1));
+    const hip = lerp(hip0, hip1, s) - HIP_ARC * 4 * s * (1 - s);
+    feetY = hip + legH(theta);
+    if (s < 0.38) board = lerp(a0, 0, ease(s / 0.38));                       // pie delantero nivela
+    else if (s > 0.7) board = 6 * Math.sin(Math.PI * (s - 0.7) / 0.3);
+    stretch = 1 + 0.06 * Math.sin(Math.PI * range(s, 0, 0.12)) - 0.03 * Math.sin(Math.PI * s);
+  } else {
+    feetY = groundY(x) - DECK;
+    stretch = 1 - 0.05 * Math.exp(-(tau - T1) * 8);
+  }
+  return { x, feetY, theta, lean: leanAngle(tau), board, airborne, stretch };
+}
+
+// ================= Cámara con cámara lenta =================
+const SLOWMO_AT = T0 + TF * 0.42;
+const speedAt = tau => 1 - 0.62 * Math.exp(-(((tau - SLOWMO_AT) / 0.22) ** 2));
+const TABLE_DT = 1 / 1000, TAU = [0];
+while (TAU[TAU.length - 1] < T_END + 0.25) {
+  const t = TAU[TAU.length - 1];
+  TAU.push(t + speedAt(t) * TABLE_DT);
+}
+const LOOP = (TAU.length - 1) * TABLE_DT;
+function tauAt(t) {
+  const i = clamp(t / TABLE_DT, 0, TAU.length - 1.001), j = Math.floor(i);
+  return lerp(TAU[j], TAU[j + 1], i - j);
+}
+function timeAt(tau) {                                  // inversa, para el audio
+  let lo = 0, hi = TAU.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (TAU[m] < tau) lo = m; else hi = m; }
+  return lo * TABLE_DT;
+}
+
+const CAM_X_MIN = -330, CAM_X_MAX = 610;
+function camTarget(tau) {
+  const s = stateAt(tau);
+  const base = lerp(TOP_Y, BOTTOM_Y, ease(range(tau, T0 + TF * 0.2, T1 + 0.15)));
+  const air = Math.max(0, base - DECK - s.feetY);
+  return { x: s.x + 120, y: base - 110 - 0.5 * air };
+}
+const CAM_Y0 = TOP_Y - 110;
+function cameraAt(tau) {
+  let x = 0, y = 0, wsum = 0;
+  for (let i = 0; i < 10; i++) {                      // suavizado determinista (seguimiento)
+    const w = 10 - i, c = camTarget(Math.max(0, tau - i * 0.035));
+    x += c.x * w; y += c.y * w; wsum += w;
+  }
+  x = clamp(x / wsum, CAM_X_MIN, CAM_X_MAX); y /= wsum;
+  const zoom = 1 + 0.08 * ease(range(tau, T0 - 0.15, T0 + 0.35)) * (1 - ease(range(tau, T1 - 0.1, T1 + 0.5)));
+  const a = tau - T1;
+  const shake = a > 0 && a < 0.5 ? Math.exp(-a * 9) : 0;
+  return { x, y, zoom, sx: Math.sin(a * 55) * 7 * shake, sy: Math.cos(a * 47) * 9 * shake };
+}
+
+function worldTransform(cam) {
+  ctx.setTransform(RES, 0, 0, RES, 0, 0);
+  ctx.translate(VW / 2 + cam.sx, VH / 2 + cam.sy);
+  ctx.scale(cam.zoom, cam.zoom);
+  ctx.translate(-cam.x, -cam.y);
+}
+// Capa con parallax: sus coordenadas y son de pantalla con la cámara inicial.
+function layerTransform(cam, p) {
+  const z = 1 + (cam.zoom - 1) * p;
+  ctx.setTransform(RES, 0, 0, RES, 0, 0);
+  ctx.translate(VW / 2 + cam.sx * p, VH / 2 + cam.sy * p);
+  ctx.scale(z, z);
+  ctx.translate(-cam.x * p, -VH / 2 - (cam.y - CAM_Y0) * p);
+}
+
+// ================= Fondo =================
+function outlined(fill, lw = 2) {
+  ctx.fillStyle = fill; ctx.fill();
+  ctx.lineWidth = lw; ctx.strokeStyle = INK; ctx.lineJoin = 'round'; ctx.stroke();
+}
+
+function cloud(cx, cy, s) {
+  ctx.beginPath();
+  ctx.arc(cx, cy, 22 * s, Math.PI * 0.5, Math.PI * 1.5);
+  ctx.arc(cx + 26 * s, cy - 18 * s, 26 * s, Math.PI, Math.PI * 1.85);
+  ctx.arc(cx + 62 * s, cy - 14 * s, 22 * s, Math.PI * 1.15, Math.PI * 1.95);
+  ctx.arc(cx + 86 * s, cy, 20 * s, Math.PI * 1.5, Math.PI * 0.5);
+  ctx.closePath();
+  ctx.fillStyle = '#ffffff'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#8cc1e6'; ctx.stroke();
+}
+
+function drawSky(cam, t) {
+  ctx.setTransform(RES, 0, 0, RES, 0, 0);
+  const g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, '#3f97de'); g.addColorStop(0.55, '#7fc0ee'); g.addColorStop(1, '#c4e6f8');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+  layerTransform(cam, 0.05);
+  for (let i = 0; i < 7; i++) {
+    const cx = -500 + i * 330 + t * (8 + i % 3 * 4);
+    cloud(cx, 70 + (i * 53) % 110, 0.8 + rand(i) * 0.6);
+  }
+}
+
+function drawFar(cam, t) {
+  layerTransform(cam, 0.18);
+  // colinas
+  ctx.beginPath(); ctx.moveTo(-400, 600);
+  for (let x = -400; x <= 1500; x += 20) ctx.lineTo(x, 300 - 26 * Math.sin(x / 160) - 14 * Math.sin(x / 63));
+  ctx.lineTo(1500, 600); ctx.closePath(); outlined('#86c45b');
+  // planta nuclear
+  const base = 300;
+  ctx.beginPath(); ctx.rect(780, base - 70, 120, 70); outlined('#b9c6cc');
+  ctx.beginPath(); ctx.rect(905, base - 150, 16, 150); outlined('#c45c4a');
+  for (const [bx, bw, bh] of [[640, 100, 160], [740, 120, 200]]) {
+    ctx.beginPath();
+    ctx.moveTo(bx, base);
+    ctx.quadraticCurveTo(bx + bw * 0.3, base - bh * 0.55, bx + bw * 0.14, base - bh);
+    ctx.lineTo(bx + bw * 0.86, base - bh);
+    ctx.quadraticCurveTo(bx + bw * 0.7, base - bh * 0.55, bx + bw, base);
+    ctx.closePath(); outlined('#9fb4be');
+    // vapor saliendo de las torres
+    for (let k = 0; k < 4; k++) {
+      const a = ((t * 0.35 + k / 4) % 1);
+      ctx.globalAlpha = 0.85 * (1 - a);
+      ctx.beginPath();
+      ctx.arc(bx + bw / 2 + a * 40, base - bh - 8 - a * 70, 14 + a * 26, 0, Math.PI * 2);
+      ctx.fillStyle = '#f2f6f8'; ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+const HOUSE_COLORS = ['#f2a65a', '#e8d27a', '#9fc7a8', '#d98c8c', '#c9a6d9', '#8fb8de'];
+function drawMid(cam) {
+  layerTransform(cam, 0.45);
+  const ground = 352;
+  ctx.fillStyle = '#6fb34d'; ctx.fillRect(-500, ground - 4, 2600, 800);
+  for (let i = 0; i < 18; i++) {
+    const hx = -400 + i * 140 + rand(i) * 30;
+    if (rand(i + 7) < 0.35) {                         // árbol
+      ctx.beginPath(); ctx.rect(hx + 26, ground - 44, 10, 44); outlined('#8a5a36');
+      ctx.beginPath(); ctx.arc(hx + 31, ground - 66, 30, 0, Math.PI * 2); outlined('#3f9a3a');
+      continue;
+    }
+    const w = 96, h = 54 + rand(i + 3) * 18;
+    ctx.beginPath(); ctx.rect(hx, ground - h, w, h); outlined(HOUSE_COLORS[i % HOUSE_COLORS.length]);
+    ctx.beginPath(); ctx.moveTo(hx - 8, ground - h); ctx.lineTo(hx + w / 2, ground - h - 34);
+    ctx.lineTo(hx + w + 8, ground - h); ctx.closePath(); outlined('#7a5148');
+    ctx.beginPath(); ctx.rect(hx + 14, ground - h + 14, 20, 16); outlined('#cfe8f5', 1.5);
+    ctx.beginPath(); ctx.rect(hx + 60, ground - 32, 20, 32); outlined('#6d4530', 1.5);
+  }
+  // cerca
+  ctx.beginPath(); ctx.rect(-500, ground - 13, 2600, 4); outlined('#f7f3e8', 1.2);
+  for (let x = -500; x < 2100; x += 22) { ctx.beginPath(); ctx.rect(x, ground - 20, 8, 24); outlined('#f7f3e8', 1.2); }
+}
+
+// ================= Plaza (capa principal) =================
+const CONCRETE = '#d3cdc1', CONCRETE_TOP = '#e6e1d6', CONCRETE_DARK = '#9f978a';
+function drawPlaza() {
+  // muro de contención detrás de la escalera y del nivel inferior, con seto encima
+  ctx.beginPath(); ctx.rect(STAIRS_X - 2, TOP_Y - 2, 2100, BOTTOM_Y - TOP_Y + 4); outlined('#b9b1a3', 2.5);
+  ctx.strokeStyle = 'rgba(31,26,23,.18)'; ctx.lineWidth = 1.5;
+  for (let x = STAIRS_X + 60; x < 2100; x += 90) { ctx.beginPath(); ctx.moveTo(x, TOP_Y); ctx.lineTo(x, BOTTOM_Y); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(STAIRS_X - 2, TOP_Y);
+  for (let x = STAIRS_X; x < 2100; x += 26) ctx.arc(x + 13, TOP_Y - 4, 15, Math.PI, 0);
+  ctx.lineTo(2100, TOP_Y); ctx.closePath(); outlined('#3f9a3a');
+  // cara frontal de los niveles y escalones
+  ctx.beginPath();
+  ctx.moveTo(-1400, TOP_Y);
+  ctx.lineTo(STAIRS_X, TOP_Y);
+  for (let i = 0; i < STEPS; i++) {
+    ctx.lineTo(STAIRS_X + i * STEP_W, TOP_Y + (i + 1) * STEP_H);
+    ctx.lineTo(STAIRS_X + (i + 1) * STEP_W, TOP_Y + (i + 1) * STEP_H);
+  }
+  ctx.lineTo(2000, BOTTOM_Y); ctx.lineTo(2000, 1400); ctx.lineTo(-1400, 1400); ctx.closePath();
+  outlined(CONCRETE, 2.5);
+  // superficie superior iluminada y contrahuellas en sombra
+  ctx.fillStyle = CONCRETE_TOP;
+  ctx.fillRect(-1400, TOP_Y + 1.5, 1400, 6);
+  ctx.fillRect(STAIRS_END, BOTTOM_Y + 1.5, 2000, 6);
+  for (let i = 0; i < STEPS; i++) {
+    const sx = STAIRS_X + i * STEP_W, sy = TOP_Y + (i + 1) * STEP_H;
+    ctx.fillStyle = CONCRETE_TOP; ctx.fillRect(sx + 2, sy + 1.5, STEP_W - 2, 5);
+    ctx.fillStyle = CONCRETE_DARK; ctx.fillRect(sx - 1, sy - STEP_H + 1, 5, STEP_H - 1);
+  }
+  // juntas
+  ctx.strokeStyle = 'rgba(31,26,23,.25)'; ctx.lineWidth = 1.5;
+  for (const jx of JOINTS) {
+    const gy = groundY(jx);
+    ctx.beginPath(); ctx.moveTo(jx, gy + 2); ctx.lineTo(jx - 40, gy + 300); ctx.stroke();
+  }
+}
+
+function drawProps() {
+  // jardinera con arbusto
+  ctx.beginPath(); ctx.rect(-560, TOP_Y - 30, 90, 30); outlined('#b7aa98');
+  ctx.beginPath(); ctx.arc(-540, TOP_Y - 34, 18, Math.PI, 0); ctx.arc(-515, TOP_Y - 40, 20, Math.PI, 0);
+  ctx.arc(-490, TOP_Y - 34, 16, Math.PI, 0); ctx.closePath(); outlined('#3f9a3a');
+  // bote de basura
+  ctx.beginPath(); ctx.moveTo(-268, TOP_Y); ctx.lineTo(-272, TOP_Y - 44); ctx.lineTo(-236, TOP_Y - 44);
+  ctx.lineTo(-240, TOP_Y); ctx.closePath(); outlined('#4f7c5a');
+  ctx.beginPath(); ctx.rect(-276, TOP_Y - 50, 44, 7); outlined('#3d6448');
+  // letrero de "prohibido patinar"
+  ctx.beginPath(); ctx.rect(-112, TOP_Y - 92, 5, 92); outlined('#6b7280', 1.5);
+  ctx.beginPath(); ctx.rect(-142, TOP_Y - 120, 64, 40); outlined('#fbfaf5');
+  ctx.beginPath(); ctx.arc(-110, TOP_Y - 100, 14, 0, Math.PI * 2);
+  ctx.lineWidth = 3.5; ctx.strokeStyle = '#d33a2c'; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-120, TOP_Y - 110); ctx.lineTo(-100, TOP_Y - 90); ctx.stroke();
+  ctx.fillStyle = INK; ctx.font = '10px Bangers, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('PROHIBIDO PATINAR', -110, TOP_Y - 72);
+  // banca
+  ctx.beginPath(); ctx.rect(640, BOTTOM_Y - 34, 120, 9); outlined('#a8673d');
+  ctx.beginPath(); ctx.rect(640, BOTTOM_Y - 60, 120, 8); outlined('#a8673d');
+  for (const lx of [650, 742]) { ctx.beginPath(); ctx.rect(lx, BOTTOM_Y - 60, 7, 60); outlined('#4b5563', 1.5); }
+  // poste de luz
+  ctx.beginPath(); ctx.rect(938, BOTTOM_Y - 210, 8, 210); outlined('#3b4250');
+  ctx.beginPath(); ctx.moveTo(942, BOTTOM_Y - 210); ctx.quadraticCurveTo(946, BOTTOM_Y - 236, 980, BOTTOM_Y - 228);
+  ctx.lineWidth = 6; ctx.strokeStyle = INK; ctx.stroke(); ctx.lineWidth = 3.5; ctx.strokeStyle = '#3b4250'; ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(982, BOTTOM_Y - 222, 14, 7, 0, 0, Math.PI * 2); outlined('#fff1a8');
+}
+
+function drawRail() {
+  const pts = [[STAIRS_X - 40, TOP_Y - RAIL_H], [STAIRS_X + 8, TOP_Y - RAIL_H],
+               [STAIRS_END - 8, BOTTOM_Y - RAIL_H], [STAIRS_END + 40, BOTTOM_Y - RAIL_H]];
+  const posts = [STAIRS_X - 34, STAIRS_X + 8, STAIRS_X + STEPS * STEP_W / 2, STAIRS_END - 8, STAIRS_END + 34];
+  const railAt = x => x <= STAIRS_X + 8 ? TOP_Y - RAIL_H : x >= STAIRS_END - 8 ? BOTTOM_Y - RAIL_H
+    : lerp(TOP_Y - RAIL_H, BOTTOM_Y - RAIL_H, (x - STAIRS_X - 8) / (STEPS * STEP_W - 16));
+  for (const [w, c] of [[7, INK], [4, '#5d6675']]) {
+    ctx.lineWidth = w; ctx.strokeStyle = c; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (const px of posts) { ctx.beginPath(); ctx.moveTo(px, railAt(px)); ctx.lineTo(px, groundY(px - 1) + 2); ctx.stroke(); }
+    ctx.beginPath(); ctx.moveTo(...pts[0]); for (const p of pts.slice(1)) ctx.lineTo(...p); ctx.stroke();
+  }
+  ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(255,255,255,.55)';
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1] - 1); for (const p of pts.slice(1)) ctx.lineTo(p[0], p[1] - 1); ctx.stroke();
+}
+
+// ================= Skate =================
+function drawBoard(spin) {
+  for (const wx of [-36, 36]) {                       // trucks
+    ctx.beginPath(); ctx.rect(wx - 9, 3.5, 18, 3.5); outlined('#9aa3ad', 1.5);
+    ctx.beginPath(); ctx.moveTo(wx - 7, 7); ctx.lineTo(wx + 7, 7); ctx.lineTo(wx + 4, 13); ctx.lineTo(wx - 4, 13);
+    ctx.closePath(); outlined('#c3cad1', 1.5);
+  }
+  for (const wx of [-36, 36]) {                       // ruedas
+    ctx.beginPath(); ctx.arc(wx, 14.5, 7.5, 0, Math.PI * 2); outlined('#f6efd9', 2);
+    ctx.beginPath(); ctx.arc(wx, 14.5, 3, 0, Math.PI * 2); outlined('#d8a33a', 1.2);
+    ctx.lineWidth = 1.5; ctx.strokeStyle = INK;
+    ctx.beginPath(); ctx.moveTo(wx + Math.cos(spin) * 4, 14.5 + Math.sin(spin) * 4);
+    ctx.lineTo(wx + Math.cos(spin) * 7, 14.5 + Math.sin(spin) * 7); ctx.stroke();
+  }
+  const deck = () => {
+    ctx.beginPath(); ctx.moveTo(-63, -9);
+    ctx.quadraticCurveTo(-54, 1.5, -42, 2); ctx.lineTo(42, 2); ctx.quadraticCurveTo(54, 1.5, 63, -9);
+  };
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  deck(); ctx.lineWidth = 8.5; ctx.strokeStyle = INK; ctx.stroke();
+  deck(); ctx.lineWidth = 5; ctx.strokeStyle = '#e4572e'; ctx.stroke();
+  ctx.save(); ctx.translate(0, -1.6); deck(); ctx.lineWidth = 2; ctx.strokeStyle = '#2a2a2a'; ctx.stroke(); ctx.restore();
+  ctx.save(); ctx.translate(0, 1.6); deck(); ctx.lineWidth = 1.4; ctx.strokeStyle = '#ffd90f'; ctx.stroke(); ctx.restore();
+}
+
+function drawSkater(s) {
+  ctx.save();
+  // tabla: gira sobre las ruedas traseras durante el pop
+  ctx.save();
+  ctx.translate(s.x, s.feetY);
+  ctx.rotate(rad(s.board));
+  drawBoard(s.x / 7.5);
+  ctx.restore();
+  // Homero, con los pies sobre la tabla
+  ctx.translate(s.x, s.feetY + 1);
+  ctx.rotate(rad(s.board * 0.45));
+  const hip = drawHomer(s.theta, s.lean, s.stretch);
+  ctx.restore();
+  return hip;
+}
+
+function drawShadow(s) {
+  const gy = groundY(s.x), h = gy - DECK - s.feetY;
+  const k = clamp(1 - h / 320, 0.3, 1);
+  ctx.fillStyle = `rgba(31,26,23,${0.28 * k})`;
+  ctx.beginPath(); ctx.ellipse(s.x, gy + 1, 64 * k, 6 * k, 0, 0, Math.PI * 2); ctx.fill();
+}
+
+// ================= Efectos =================
+function dustPuffs(tau, t0, cx, cy, n, dir, seed) {
+  const a = tau - t0;
+  if (a < 0 || a > 0.75) return;
+  const k = a / 0.75;
+  for (let i = 0; i < n; i++) {                       // nubecitas que salen hacia un lado (dir = ±1)
+    const dist = (30 + rand(seed + i + 9) * 50) * ease(Math.min(1, k * 1.6));
+    const px = cx + dir * dist * (0.4 + 0.6 * rand(seed + i));
+    const py = cy - 6 - rand(seed + i + 5) * dist * 0.45;
+    const r = (6 + rand(seed + i + 3) * 8) * (0.6 + k);
+    ctx.globalAlpha = 1 - k;
+    ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); outlined('#f1ede4', 1.5);
   }
   ctx.globalAlpha = 1;
 }
 
-// ---------- Dibujo del escenario ----------
-function drawBackground(t) {
-  const sky = ctx.createLinearGradient(0, 0, 0, H);
-  sky.addColorStop(0, '#5aa9e6'); sky.addColorStop(0.7, '#a9d8f5'); sky.addColorStop(1, '#d9f0fb');
-  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
-
-  // sol
-  ctx.fillStyle = '#ffe680';
-  ctx.beginPath(); ctx.arc(830, 90, 46, 0, Math.PI * 2); ctx.fill();
-
-  // nubes a la deriva
-  for (let i = 0; i < 4; i++) {
-    const cx = ((i * 290 + t * (14 + i * 6)) % (W + 300)) - 150;
-    const cy = 70 + i * 34 % 90;
-    ctx.fillStyle = 'rgba(255,255,255,.92)';
-    ctx.beginPath();
-    ctx.arc(cx, cy, 26, 0, Math.PI * 2); ctx.arc(cx + 30, cy - 12, 32, 0, Math.PI * 2);
-    ctx.arc(cx + 64, cy, 24, 0, Math.PI * 2); ctx.fill();
+function impactLines(tau, t0, cx, cy) {
+  const a = tau - t0;
+  if (a < 0 || a > 0.22) return;
+  const k = a / 0.22;
+  ctx.strokeStyle = INK; ctx.lineWidth = 2.5 * (1 - k); ctx.lineCap = 'round';
+  for (let i = 0; i < 7; i++) {
+    const ang = rad(-170 + i * 26.6);
+    const r0 = 70 + k * 30, r1 = r0 + 16;
+    ctx.beginPath(); ctx.moveTo(cx + Math.cos(ang) * r0, cy + Math.sin(ang) * r0 * 0.6);
+    ctx.lineTo(cx + Math.cos(ang) * r1, cy + Math.sin(ang) * r1 * 0.6); ctx.stroke();
   }
-
-  // torres de enfriamiento de la planta nuclear al fondo
-  ctx.fillStyle = '#8fb3c9';
-  for (const [bx, bw, bh] of [[600, 90, 150], [705, 110, 185]]) {
-    const base = 330;
-    ctx.beginPath();
-    ctx.moveTo(bx, base);
-    ctx.quadraticCurveTo(bx + bw * 0.28, base - bh * 0.55, bx + bw * 0.12, base - bh);
-    ctx.lineTo(bx + bw * 0.88, base - bh);
-    ctx.quadraticCurveTo(bx + bw * 0.72, base - bh * 0.55, bx + bw, base);
-    ctx.closePath(); ctx.fill();
-  }
-  // edificios lejanos
-  ctx.fillStyle = '#a3c3d6';
-  for (let i = 0; i < 9; i++) {
-    const bx = 20 + i * 64, bh = 50 + rand(i + 3) * 90;
-    ctx.fillRect(bx, 330 - bh, 50, bh);
-  }
-  // pasto
-  ctx.fillStyle = '#7cc46a'; ctx.fillRect(0, 300, W, 40);
 }
 
-function drawGround() {
-  const concrete = '#c9c4ba', edge = '#9d978c', dark = '#857f74';
-  // plataforma superior
-  ctx.fillStyle = concrete; ctx.fillRect(0, TOP_Y, STAIRS_X, H - TOP_Y);
-  // escalones
-  for (let i = 0; i < STEPS; i++) {
-    const sx = STAIRS_X + i * STEP_W, sy = TOP_Y + (i + 1) * STEP_H;
-    ctx.fillStyle = concrete; ctx.fillRect(sx, sy, W - sx, H - sy);
-    ctx.fillStyle = dark; ctx.fillRect(sx, sy - STEP_H, 4, STEP_H);   // contrahuella en sombra
-    ctx.fillStyle = edge; ctx.fillRect(sx, sy, STEP_W, 4);            // borde del escalón
-  }
-  ctx.fillStyle = dark; ctx.fillRect(STAIRS_X - 2, TOP_Y, 4, STEP_H);
-  ctx.fillStyle = edge; ctx.fillRect(0, TOP_Y, STAIRS_X, 4);
-  ctx.fillRect(STAIRS_END, BOTTOM_Y, W - STAIRS_END, 4);
-  // juntas de la banqueta
-  ctx.strokeStyle = 'rgba(0,0,0,.08)'; ctx.lineWidth = 2;
-  for (let x = 60; x < STAIRS_X; x += 120) { ctx.beginPath(); ctx.moveTo(x, TOP_Y + 4); ctx.lineTo(x - 30, H); ctx.stroke(); }
-  for (let x = STAIRS_END + 80; x < W; x += 120) { ctx.beginPath(); ctx.moveTo(x, BOTTOM_Y + 4); ctx.lineTo(x - 20, H); ctx.stroke(); }
-
-  // pasamanos
-  ctx.strokeStyle = '#4b5563'; ctx.lineWidth = 5; ctx.lineCap = 'round';
-  const railH = 58;
+function burst(cx, cy, r, spikes) {
   ctx.beginPath();
-  ctx.moveTo(STAIRS_X - 30, TOP_Y - railH);
-  ctx.lineTo(STAIRS_X + 10, TOP_Y - railH);
-  ctx.lineTo(STAIRS_END - 10, BOTTOM_Y - railH);
-  ctx.lineTo(STAIRS_END + 30, BOTTOM_Y - railH);
-  ctx.stroke();
-  ctx.lineWidth = 4;
-  for (const px of [STAIRS_X + 10, STAIRS_X + 2.5 * STEP_W, STAIRS_END - 10]) {
-    const top = lerp(TOP_Y - railH, BOTTOM_Y - railH, (px - STAIRS_X - 10) / (STEPS * STEP_W - 20));
-    ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, groundY(px - 1)); ctx.stroke();
+  for (let i = 0; i < spikes * 2; i++) {
+    const a = Math.PI * i / spikes, rr = i % 2 ? r * 0.72 : r * (1 + 0.08 * rand(i));
+    ctx.lineTo(cx + Math.cos(a) * rr * 1.35, cy + Math.sin(a) * rr * 0.8);
   }
+  ctx.closePath();
 }
 
-// ---------- Skate ----------
-const BOARD_L = 128;
-function drawBoard(wheelSpin) {
-  // ruedas y trucks
-  for (const wx of [-40, 40]) {
-    ctx.fillStyle = '#6b7280'; ctx.fillRect(wx - 9, 4, 18, 6);
-    ctx.fillStyle = '#f5f5f4';
-    ctx.beginPath(); ctx.arc(wx, 15, 8, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#444'; ctx.lineWidth = 2; ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(wx, 15); ctx.lineTo(wx + Math.cos(wheelSpin) * 6, 15 + Math.sin(wheelSpin) * 6); ctx.stroke();
-  }
-  // tabla con nose y tail levantados
-  const half = BOARD_L / 2;
-  ctx.fillStyle = '#e4572e'; ctx.strokeStyle = '#2b1b17'; ctx.lineWidth = 2.5;
-  ctx.beginPath();
-  ctx.moveTo(-half + 14, 0);
-  ctx.lineTo(half - 14, 0);
-  ctx.quadraticCurveTo(half + 2, 0, half + 4, -10);
-  ctx.quadraticCurveTo(half + 4, -4, half - 12, 5);
-  ctx.lineTo(-half + 12, 5);
-  ctx.quadraticCurveTo(-half - 4, -4, -half - 4, -10);
-  ctx.quadraticCurveTo(-half - 2, 0, -half + 14, 0);
-  ctx.closePath(); ctx.fill(); ctx.stroke();
-  ctx.fillStyle = '#ffd90f'; ctx.fillRect(-14, 0.5, 28, 3.5);
-}
-
-// ---------- Personaje ----------
-const HOMER_H = 190;
-function drawSkater(t, alpha = 1) {
-  const s = stateAt(t);
-  const boardY = s.y - 19 - s.boardLift;         // 19 = radio rueda + truck
+function drawWooHoo(tau, sx, sy) {
+  const a = tau - T1 - 0.06;
+  if (a < 0 || a > 1.15) return;
+  const pop = a < 0.18 ? 1.15 * Math.sin(Math.PI / 2 * a / 0.18) : 1 + 0.15 * Math.exp(-(a - 0.18) * 10);
   ctx.save();
-  ctx.globalAlpha = alpha;
-
-  // tabla (gira sobre la cola en el pop)
-  ctx.save();
-  const pivotX = s.boardAngle < 0 && s.airborne ? -BOARD_L / 2 + 8 : 0;
-  ctx.translate(s.x + pivotX, boardY);
-  ctx.rotate(s.boardAngle * Math.PI / 180);
-  ctx.translate(-pivotX, 0);
-  drawBoard((s.x / 8) % (Math.PI * 2));
-  ctx.restore();
-
-  // Homero sobre la tabla
-  if (homer.complete && homer.naturalWidth) {
-    const hw = HOMER_H * homer.naturalWidth / homer.naturalHeight;
-    const hh = HOMER_H * s.squash;
-    ctx.save();
-    ctx.translate(s.x, boardY + 2);
-    ctx.rotate(s.lean * Math.PI / 180);
-    ctx.scale(1 + (1 - s.squash) * 0.5, 1);       // conservar volumen al aplastarse
-    ctx.drawImage(homer, -hw / 2, -hh, hw, hh);
-    ctx.restore();
-  }
-  ctx.restore();
-  return s;
-}
-
-function drawShadow(s) {
-  const gy = groundY(s.x);
-  const h = gy - s.y;
-  const k = clamp(1 - h / 260, 0.25, 1);
-  ctx.fillStyle = `rgba(0,0,0,${0.22 * k})`;
-  ctx.beginPath(); ctx.ellipse(s.x, gy + 2, 70 * k, 7 * k, 0, 0, Math.PI * 2); ctx.fill();
-}
-
-function drawSpeech(t, s) {
-  const age = t - T_LAND - 0.1;
-  if (age < 0 || age > 0.75) return;
-  const pop = Math.min(1, age / 0.15);
-  const bx = Math.min(s.x + 70, W - 100), by = s.y - HOMER_H - 20;
-  ctx.save();
-  ctx.translate(bx, by); ctx.scale(pop, pop);
-  ctx.globalAlpha = age > 0.55 ? 1 - (age - 0.55) / 0.2 : 1;
-  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#222'; ctx.lineWidth = 3;
-  ctx.beginPath(); ctx.ellipse(0, 0, 92, 36, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(-50, 24); ctx.lineTo(-74, 52); ctx.lineTo(-28, 30); ctx.fill(); ctx.stroke();
-  ctx.fillStyle = '#fff'; ctx.fillRect(-52, 20, 26, 10);
-  ctx.fillStyle = '#222'; ctx.font = 'bold 30px "Comic Sans MS", "Chalkboard SE", system-ui, sans-serif';
+  ctx.translate(clamp(sx, 120, VW - 120), clamp(sy, 70, VH - 70));
+  ctx.rotate(rad(-6 + 2 * Math.sin(a * 12)));
+  ctx.scale(pop, pop);
+  ctx.globalAlpha = a > 0.9 ? 1 - (a - 0.9) / 0.25 : 1;
+  burst(0, 0, 70, 14); outlined('#ffd90f', 3);
+  ctx.font = '40px Bangers, Impact, sans-serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText('¡Woo-hoo!', 0, 2);
+  ctx.lineWidth = 6; ctx.strokeStyle = '#ffffff'; ctx.strokeText('WOO-HOO!', 0, 3);
+  ctx.fillStyle = '#d33a2c'; ctx.fillText('WOO-HOO!', 0, 3);
   ctx.restore();
 }
 
-function drawSpeedLines(t, s) {
-  if (s.x < 0 || s.x > W) return;
-  ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = 3; ctx.lineCap = 'round';
-  for (let i = 0; i < 4; i++) {
-    const off = (t * 900 + i * 37) % 60;
-    const ly = s.y - 40 - i * 38;
-    ctx.beginPath(); ctx.moveTo(s.x - 70 - off, ly); ctx.lineTo(s.x - 110 - off - i * 6, ly); ctx.stroke();
-  }
+function drawTitle(t) {
+  const inK = ease(range(t, 0.45, 0.85)), outK = ease(range(t, 2.9, 3.3));
+  if (inK <= 0 || outK >= 1) return;
+  const x = lerp(-380, 36, inK) - outK * 420;
+  ctx.setTransform(RES, 0, 0, RES, 0, 0);
+  ctx.save();
+  ctx.translate(x, 440);
+  ctx.fillStyle = '#ffd90f'; ctx.fillRect(0, 0, 300, 40);
+  ctx.fillStyle = INK; ctx.fillRect(0, 40, 300, 26);
+  ctx.fillStyle = INK; ctx.font = '34px Bangers, Impact, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  ctx.fillText('HOMERO J. SIMPSON', 12, 22);
+  ctx.fillStyle = '#f4f1e8'; ctx.font = '600 13px Inter, system-ui, sans-serif';
+  ctx.fillText('Ollie · 6 escalones · Springfield', 12, 54);
+  ctx.restore();
 }
 
-// ---------- Render de un cuadro ----------
+function drawForeground(cam) {
+  layerTransform(cam, 1.35);
+  ctx.save();
+  ctx.filter = 'blur(5px)';
+  for (const fx of [-60, 1180]) {
+    ctx.beginPath();
+    ctx.arc(fx, 590, 45, Math.PI, 0); ctx.arc(fx + 55, 580, 40, Math.PI, 0); ctx.arc(fx + 105, 596, 36, Math.PI, 0);
+    ctx.lineTo(fx + 145, 700); ctx.lineTo(fx - 45, 700); ctx.closePath();
+    ctx.fillStyle = '#24502a'; ctx.fill();
+  }
+  ctx.restore();
+}
+
+let VIGNETTE = null;
+function drawVignette(t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (!VIGNETTE) {
+    VIGNETTE = ctx.createRadialGradient(canvas.width / 2, canvas.height / 2, canvas.height * 0.45,
+                                        canvas.width / 2, canvas.height / 2, canvas.height * 1.05);
+    VIGNETTE.addColorStop(0, 'rgba(0,0,0,0)'); VIGNETTE.addColorStop(1, 'rgba(0,0,0,.38)');
+  }
+  ctx.fillStyle = VIGNETTE; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const fade = Math.max(1 - range(t, 0, 0.3), range(t, LOOP - 0.35, LOOP));
+  if (fade > 0) { ctx.fillStyle = `rgba(0,0,0,${fade})`; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+}
+
+// ================= Render =================
 function renderAt(t) {
   t = ((t % LOOP) + LOOP) % LOOP;
-  drawBackground(t);
-  drawGround();
+  const tau = tauAt(t);
+  const cam = cameraAt(tau);
+  const s = stateAt(tau);
 
-  const s = stateAt(t);
+  drawSky(cam, t);
+  drawFar(cam, t);
+  drawMid(cam);
+
+  worldTransform(cam);
+  drawPlaza();
+  drawProps();
   drawShadow(s);
-  drawSpeedLines(t, s);
+  drawRail();
+  dustPuffs(tau, T0 - 0.02, TAKEOFF_X - 58, TOP_Y, 5, -1, 3);
+  impactLines(tau, T1, LAND_X, BOTTOM_Y - 4);
+  dustPuffs(tau, T1, LAND_X - 50, BOTTOM_Y, 6, -1, 11);
+  dustPuffs(tau, T1, LAND_X + 50, BOTTOM_Y, 6, 1, 23);
+  const hip = drawSkater(s);
+  const head = ctx.getTransform().transformPoint(new DOMPoint(s.x + hip.hx, s.feetY + hip.hy - 130));
 
-  // estela fantasma durante el salto
-  if (s.airborne) for (let k = 4; k >= 1; k--) {
-    const tg = t - k * 0.05;
-    if (tg > T_TAKEOFF) drawSkater(tg, 0.1 + 0.05 * (4 - k));
-  }
-  drawSkater(t);
-
-  drawBurst(t, T_TAKEOFF, TAKEOFF_X - BOARD_L / 2 + 6, TOP_Y, 10, 120, '#b8b2a6', 1);
-  drawBurst(t, T_LAND, LAND_X - 40, BOTTOM_Y, 9, 150, '#b8b2a6', 21);
-  drawBurst(t, T_LAND, LAND_X + 40, BOTTOM_Y, 9, 150, '#b8b2a6', 41);
-  drawSpeech(t, s);
+  drawForeground(cam);
+  ctx.setTransform(RES, 0, 0, RES, 0, 0);
+  drawWooHoo(tau, head.x / RES + 110, head.y / RES + 10);
+  drawTitle(t);
+  drawVignette(t);
 }
 
-// ---------- Bucle ----------
-let simTime = 0, last = null, paused = false, slow = false;
+// ================= Bucle interactivo =================
+let simTime = 0, last = null, paused = false, slow = false, soundOn = false;
+const sfx = new Audio('ollie-sfx.m4a');
+sfx.loop = true;
+
+function syncAudio() {
+  if (!soundOn || paused) { sfx.pause(); return; }
+  sfx.playbackRate = slow ? 0.3 : 1;
+  const want = simTime % LOOP;
+  if (Math.abs(sfx.currentTime - want) > 0.08) sfx.currentTime = want;
+  if (sfx.paused) sfx.play().catch(() => {});
+}
+
 function frame(now) {
   if (last !== null && !paused) simTime += (now - last) / 1000 * (slow ? 0.3 : 1);
   last = now;
   renderAt(simTime);
+  syncAudio();
   requestAnimationFrame(frame);
 }
 
-const toggle = (btn, get, set) => btn.addEventListener('click', () => {
-  set(!get()); btn.setAttribute('aria-pressed', String(get()));
-});
-toggle(document.getElementById('pause'), () => paused, v => paused = v);
-toggle(document.getElementById('slow'), () => slow, v => slow = v);
+const toggle = (id, get, set) => {
+  const btn = document.getElementById(id);
+  btn.addEventListener('click', () => { set(!get()); btn.setAttribute('aria-pressed', String(get())); });
+};
+toggle('pause', () => paused, v => paused = v);
+toggle('slow', () => slow, v => slow = v);
+toggle('sound', () => soundOn, v => soundOn = v);
 document.getElementById('restart').addEventListener('click', () => { simTime = 0; });
 
-window.renderAt = renderAt;   // usado por record.js para exportar el video
-window.LOOP = LOOP;
-homer.onload = () => { window.ready = true; if (!new URLSearchParams(location.search).has('capture')) requestAnimationFrame(frame); };
+// Datos para record.js / sfx.py (audio sincronizado con la animación).
+window.renderAt = renderAt;
+window.timeline = {
+  loop: LOOP,
+  pop: timeAt(T0 - 0.03),
+  land: timeAt(T1),
+  rolling: [[0, timeAt(T0 - 0.03)], [timeAt(T1), timeAt(T_END)]],
+  slowmo: [timeAt(SLOWMO_AT - 0.3), timeAt(SLOWMO_AT + 0.3)],
+  clicks: JOINTS.flatMap(jx => [jx + 36, jx - 36].map(x => (x - START_X) / SPEED))
+               .filter(tau => tau > 0 && (tau < T0 - 0.03 || (tau > T1 && tau < T_END))).map(timeAt),
+};
+
+Promise.all([
+  new Promise(r => homer.complete && homer.naturalWidth ? r() : (homer.onload = r)),
+  document.fonts.load('40px Bangers'),
+]).then(() => {
+  setupRig();
+  window.ready = true;
+  if (!new URLSearchParams(location.search).has('capture')) requestAnimationFrame(frame);
+});
 </script>
 </body>
 </html>
